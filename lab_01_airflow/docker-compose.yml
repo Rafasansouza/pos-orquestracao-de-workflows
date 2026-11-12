@@ -1,0 +1,143 @@
+# =============================================================================
+# Lab: Orquestração de Workflows — Aula 1
+# Apache Airflow 2.x + PostgreSQL (metadata DB + destino do ETL)
+# =============================================================================
+# USO:
+#   docker compose up -d          → sobe todos os serviços
+#   docker compose ps             → verifica saúde dos containers
+#   docker compose logs -f        → acompanha logs em tempo real
+#   docker compose down -v        → derruba e apaga volumes
+# =============================================================================
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.3-python3.11
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-meta/airflow
+    AIRFLOW__CORE__FERNET_KEY: "46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLt0nfd7cA="
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__WEBSERVER__SECRET_KEY: "lab-secret-key-2024"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+    # Provider de PostgreSQL para o lab
+    _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-postgres==5.11.0 pandas==2.2.2 requests==2.32.3"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+  depends_on:
+    postgres-meta:
+      condition: service_healthy
+  networks:
+    - airflow-net
+
+services:
+  # ── Banco de dados de metadados do Airflow ──────────────────────────────────
+  postgres-meta:
+    image: postgres:16
+    container_name: airflow-meta-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-meta-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    networks:
+      - airflow-net
+
+  # ── Banco de dados DESTINO do ETL (onde o DAG vai inserir dados) ────────────
+  postgres-lab:
+    image: postgres:16
+    container_name: airflow-lab-db
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab123
+      POSTGRES_DB: labdb
+    volumes:
+      - postgres-lab-data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "25433:5432"        # acessível em localhost:5433 para inspeção externa
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "lab"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    networks:
+      - airflow-net
+
+  # ── Inicialização do banco de metadados (roda uma vez e sai) ────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname Lab \
+          --role Admin \
+          --email admin@lab.local \
+          --password admin
+        airflow connections add postgres_lab \
+          --conn-type postgres \
+          --conn-host postgres-lab \
+          --conn-login lab \
+          --conn-password lab123 \
+          --conn-schema labdb \
+          --conn-port 5432
+        echo "=== Airflow inicializado. Acesse http://localhost:8080 ==="
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+    depends_on:
+      postgres-meta:
+        condition: service_healthy
+      postgres-lab:
+        condition: service_healthy
+
+  # ── Scheduler ───────────────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob", "--hostname", "$${HOSTNAME}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Webserver (UI) ──────────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "28080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres-meta-data:
+  postgres-lab-data:
+
+networks:
+  airflow-net:
+    driver: bridge
