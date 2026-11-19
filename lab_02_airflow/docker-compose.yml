@@ -1,0 +1,272 @@
+# =============================================================================
+# Lab: Orquestração de Workflows — Aula 2
+# Apache Airflow 2.x + PostgreSQL (metadata DB + destino do ETL)
+# =============================================================================
+#
+# O QUE ESTE ARQUIVO SOBE (6 containers):
+#
+#   postgres-meta      → banco INTERNO do Airflow (guarda DAGs, runs, logs de
+#                        execução, usuários, connections...). Você não mexe nele.
+#   postgres-lab       → banco do LAB: é onde as nossas DAGs gravam os dados.
+#   airflow-init       → roda UMA vez: prepara o banco interno, cria o usuário
+#                        admin e a connection "postgres_lab". Depois encerra.
+#   airflow-scheduler  → o "cérebro": lê as DAGs da pasta ./dags, decide o que
+#                        precisa rodar e executa as tasks.
+#   airflow-webserver  → a interface web: http://localhost:8080
+#   fake-api           → API de mentira que falha de propósito (aula de retries).
+#
+# ANTES DE SUBIR PELA PRIMEIRA VEZ:
+#   Linux/macOS:  mkdir -p logs && chmod -R 777 logs
+#                 (o Airflow roda como outro usuário dentro do container e
+#                  precisa de permissão para escrever os logs nessa pasta)
+#   Windows:      não precisa fazer nada (Docker Desktop já libera a pasta)
+#
+# COMANDOS DO DIA A DIA (rodar dentro desta pasta):
+#   docker compose up -d          → sobe todos os serviços em segundo plano
+#   docker compose ps             → mostra o estado de cada container
+#                                   (espere "healthy" no scheduler e webserver)
+#   docker compose logs -f        → acompanha os logs em tempo real (Ctrl+C sai)
+#   docker compose down           → derruba os containers (MANTÉM os dados)
+#   docker compose down -v        → derruba e APAGA os bancos (recomeça do zero)
+#
+# ACESSO:
+#   Airflow UI ............ http://localhost:8080   (usuário: admin / senha: admin)
+#   Fake API (docs) ....... http://localhost:5001/docs
+#   Banco do lab .......... localhost:5433  (usuário: lab / senha: lab123 / banco: labdb)
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# BLOCO COMUM DO AIRFLOW
+# -----------------------------------------------------------------------------
+# Scheduler, webserver e init usam exatamente a mesma imagem e configuração.
+# Em vez de repetir tudo três vezes, definimos aqui uma "âncora" YAML
+# (&airflow-common) e reaproveitamos lá embaixo com "<<: *airflow-common".
+# -----------------------------------------------------------------------------
+x-airflow-common: &airflow-common
+  # Imagem oficial do Airflow: versão 2.9.3 com Python 3.11
+  image: apache/airflow:2.9.3-python3.11
+
+  # Configurações do Airflow via variáveis de ambiente.
+  # Padrão do nome: AIRFLOW__<SEÇÃO>__<CHAVE>  (dois underscores entre as partes)
+  # Ex.: AIRFLOW__CORE__EXECUTOR equivale a [core] executor no airflow.cfg
+  environment: &airflow-common-env
+    # Executor = COMO as tasks são executadas.
+    # LocalExecutor roda várias tasks em paralelo, na mesma máquina do scheduler.
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+
+    # Endereço do banco INTERNO do Airflow (o container postgres-meta).
+    # Formato: driver://usuario:senha@host/banco
+    # O "host" é o nome do serviço no compose, não "localhost".
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-meta/airflow
+
+    # Chave usada para criptografar senhas das Connections no banco.
+    # Em produção ela deve ser secreta; aqui é fixa só para o lab.
+    AIRFLOW__CORE__FERNET_KEY: "46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLt0nfd7cA="
+
+    # Toda DAG nova aparece PAUSADA na interface.
+    # Para ela rodar, é preciso ligar o botão (toggle) ao lado do nome.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+
+    # Não carrega as dezenas de DAGs de exemplo que vêm com o Airflow,
+    # para a interface mostrar só as DAGs do lab.
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+    # Chave usada pelo webserver para assinar a sessão de login.
+    AIRFLOW__WEBSERVER__SECRET_KEY: "lab-secret-key-2024"
+
+    # Permite ver a configuração completa em Admin → Configurations na UI.
+    # Útil para estudo; em produção fica desligado.
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+
+    # Libera a API REST do Airflow com usuário e senha (basic auth).
+    # Ex.: curl -u admin:admin http://localhost:8080/api/v1/dags
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+
+    # Pacotes Python extras instalados toda vez que o container sobe:
+    #   - provider do Postgres (traz o PostgresHook usado nas DAGs)
+    #   - pandas (transformação dos dados)
+    #   - requests (chamadas HTTP às APIs)
+    # Atalho para lab. Em produção, o certo é criar uma imagem própria.
+    _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-postgres==5.11.0 pandas==2.2.2 requests==2.32.3"
+
+  # Pastas do seu computador "espelhadas" dentro do container (pasta_local:pasta_container).
+  # Qualquer arquivo salvo em ./dags aparece no Airflow sem reiniciar nada
+  # (o scheduler relê a pasta periodicamente; pode levar alguns segundos).
+  volumes:
+    - ./dags:/opt/airflow/dags          # suas DAGs (.py)
+    - ./logs:/opt/airflow/logs          # logs de cada task, visíveis também pela UI
+    - ./plugins:/opt/airflow/plugins    # plugins customizados (não usado neste lab)
+
+  # Só inicia depois que o banco interno estiver pronto ("healthy").
+  depends_on:
+    postgres-meta:
+      condition: service_healthy
+
+  # Rede interna: permite que os containers se encontrem pelo nome do serviço.
+  networks:
+    - airflow-net
+
+
+services:
+  # ── Banco de dados de metadados do Airflow ──────────────────────────────────
+  # Banco INTERNO: o Airflow guarda aqui o histórico de execuções, estado das
+  # tasks, XComs, usuários e connections. Não é exposto para fora do Docker.
+  postgres-meta:
+    image: postgres:16
+    container_name: airflow-meta-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      # Volume nomeado: os dados sobrevivem a "docker compose down".
+      # Só são apagados com "docker compose down -v".
+      - postgres-meta-data:/var/lib/postgresql/data
+    # Healthcheck: o Docker testa a cada 10s se o banco já aceita conexões.
+    # Os serviços do Airflow esperam esse teste passar antes de iniciar.
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    networks:
+      - airflow-net
+
+  # ── Banco de dados DESTINO do ETL (onde o DAG vai inserir dados) ────────────
+  # É o banco "de negócio" do lab: as DAGs gravam aqui os dados de clima.
+  # Dentro do Docker, as DAGs o acessam como host "postgres-lab", porta 5432
+  # (já configurado na connection "postgres_lab").
+  postgres-lab:
+    image: postgres:16
+    container_name: airflow-lab-db
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab123
+      POSTGRES_DB: labdb
+    volumes:
+      - postgres-lab-data:/var/lib/postgresql/data
+      # Scripts em /docker-entrypoint-initdb.d rodam AUTOMATICAMENTE na primeira
+      # vez que o banco é criado: aqui o init.sql cria a tabela "clima".
+      # Atenção: se o volume já existir, o script NÃO roda de novo
+      # (para forçar, use "docker compose down -v" e suba novamente).
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      # porta_no_seu_computador:porta_no_container
+      # Do seu computador (DBeaver, pgAdmin, psql), conecte em localhost:5433.
+      # Usamos 5433 para não conflitar com um Postgres que você já tenha na 5432.
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "lab"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    networks:
+      - airflow-net
+
+  # ── Inicialização do banco de metadados (roda uma vez e sai) ────────────────
+  # Prepara o Airflow e ENCERRA. Em "docker compose ps" ele aparece como
+  # "Exited (0)": isso é o esperado, significa que terminou sem erro.
+  airflow-init:
+    <<: *airflow-common                  # herda imagem, variáveis e volumes do bloco comum
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # 1) Cria/atualiza as tabelas do banco interno do Airflow
+        airflow db migrate
+        # 2) Cria o usuário de acesso à interface web
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname Lab \
+          --role Admin \
+          --email admin@lab.local \
+          --password admin
+        # 3) Cria a Connection "postgres_lab", que as DAGs usam para acessar o
+        #    banco do lab sem escrever host/usuário/senha no código.
+        #    (veja em Admin → Connections na UI)
+        airflow connections add postgres_lab \
+          --conn-type postgres \
+          --conn-host postgres-lab \
+          --conn-login lab \
+          --conn-password lab123 \
+          --conn-schema labdb \
+          --conn-port 5432
+        echo "=== Airflow inicializado. Acesse http://localhost:8080 ==="
+    environment:
+      <<: *airflow-common-env            # herda todas as variáveis do bloco comum
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+    # Só roda quando os DOIS bancos estiverem prontos.
+    depends_on:
+      postgres-meta:
+        condition: service_healthy
+      postgres-lab:
+        condition: service_healthy
+
+  # ── Scheduler ───────────────────────────────────────────────────────────────
+  # Monitora a pasta ./dags, agenda as execuções conforme o "schedule" de cada
+  # DAG e dispara as tasks. Sem ele, nada roda (a UI só mostra).
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    # Verifica a cada 30s se o scheduler está vivo e trabalhando.
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob", "--allow-multiple", "--limit", "100"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    # Se o processo cair, o Docker reinicia sozinho.
+    restart: unless-stopped
+
+  # ── Webserver (UI) ──────────────────────────────────────────────────────────
+  # Interface web para ver DAGs, disparar execuções, ler logs e acompanhar
+  # o Grid/Graph/Gantt. Acesse http://localhost:8080 (admin / admin).
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    # Considera "healthy" quando a página /health responde.
+    # Pode levar 1 a 2 minutos na primeira subida.
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Fake API para testar retries ────────────────────────────────────────────
+  # Pequena API (FastAPI, código em ./fake-api/app.py) que simula um serviço
+  # instável. Endpoints:
+  #   /data              → falha (erro 500) nas 2 primeiras chamadas, depois responde OK
+  #   /data/always-fail  → falha sempre
+  #   /reset             → zera o contador de chamadas
+  # As DAGs a acessam como http://fake-api:5000 (nome do serviço, porta interna).
+  fake-api:
+    build: ./fake-api                    # imagem construída a partir do Dockerfile local
+    container_name: fake-api
+    ports:
+      # Do seu navegador: http://localhost:5001/docs para testar manualmente
+      - "5001:5000"
+    networks:
+      - airflow-net
+
+# Volumes nomeados: o Docker guarda os dados dos bancos fora dos containers,
+# então eles não se perdem ao derrubar e subir de novo.
+volumes:
+  postgres-meta-data:
+  postgres-lab-data:
+
+# Rede privada compartilhada por todos os serviços.
+# Dentro dela, um container encontra o outro pelo nome do serviço
+# (ex.: "postgres-lab", "fake-api"), como se fosse um endereço de rede.
+networks:
+  airflow-net:
+    driver: bridge
